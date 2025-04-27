@@ -5,7 +5,7 @@ This tool detects drift between Terraform state and configuration, specifically 
 ## Getting Started
 
 ### Clone the Repository
-- `git clone https://github.com/oldmonad/ec2Drift.git`
+- `git clone https://github.com/oldmonad/ec2Drift`
 - `cd ec2drift`
 - go version `1.19+`
 
@@ -15,18 +15,22 @@ This tool detects drift between Terraform state and configuration, specifically 
 
 ## Running the Application
 - First, build the binary: `go build -o ec2drift ./cmd/main.go`, this will create an executable file named `ec2drift` in the current directory.
-- Run the application: `./ec2drift --old-state samples/terraform.tfstate --new-state samples/dev.tfvars`
-- Run the application with attributes: `./ec2drift --old-state samples/terraform.tfstate --new-state samples/dev.tfvars --attributes security_groups`
-- Supported attributes for drift checks: `ami`, `instance_type`, `security_groups`, `source_dest_check`, `subnet_id`, `vpc_security_group_ids`
+- The application supports both CLI and HTTP interfaces.
+- Run the application via the CLI: `./ec2drift run`
+- Start the application with http server: `./ec2drift serve --port 8080`
+- Run CLI application with comma separated attributes: `./ec2drift run --attributes,security_groups`
+- Sample http request: `curl -X POST http://localhost:8080/drift -H "Content-Type: application/json" -d '{}'`
+- Supported attributes for drift checks: `ami`, `instance_type`, `security_groups`,`root_block_device.volume_size`,
+`root_block_device.volume_type`
+- Create a .env file and setup environment variables, check .env.example for reference
 
 ## Running Tests
 - Unit tests for the core logic be run as follows:
-  - For the whole core logic folder, use `go test ./internal/*`
-  - For specific modules, use `go test ./internal/comparator`
-  - For specific tests use `go test ./internal/comparator -run TestDetectDriftBasicDrift`, `TestDetectDriftBasicDrift` is a test function that detects basic drift between Terraform state and configuration.
+  - For specific modules, use `go test ./internal/app`
+  - For specific tests use `go test ./internal/driftchecker -run TestDetectBasicDrift`, `TestDetectBasicDrift` is a test function that detects basic drift between Terraform state and configuration.
 
 - To view and generate coverage report:
-  - `go test ./internal/* -cover -v -coverprofile=coverage.out`
+  - `go test ./internal/app -cover -v -coverprofile=coverage.out`
   - `go tool cover -html=coverage.out -o coverage.html`
   - `open coverage.html`
 

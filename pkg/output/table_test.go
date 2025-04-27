@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/fatih/color"
-	"github.com/oldmonad/ec2Drift.git/internal/comparator"
-	"github.com/oldmonad/ec2Drift.git/internal/output"
+	"github.com/oldmonad/ec2Drift/internal/driftchecker"
+	"github.com/oldmonad/ec2Drift/pkg/output"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -19,8 +19,6 @@ func init() {
 
 func captureOutput(f func()) string {
 	old := os.Stdout
-	color.NoColor = false
-
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 
@@ -41,18 +39,16 @@ func TestPrintTableEmptyReports(t *testing.T) {
 
 	expectedHeader := "INSTANCE ID\tAPPLICATION\tATTRIBUTE\tEXPECTED\tACTUAL"
 	assert.Contains(t, output, expectedHeader)
-	assert.True(t, strings.HasPrefix(output, expectedHeader),
-		"Table should start with header row")
-	assert.Equal(t, strings.Count(output, "\n"), 1,
-		"Should only have header row with no data rows")
+	assert.True(t, strings.HasPrefix(output, expectedHeader), "Table should start with header")
+	assert.Equal(t, 1, strings.Count(output, "\n"), "Only header should be present")
 }
 
 func TestPrintTableMatchingValues(t *testing.T) {
-	reports := []comparator.DriftReport{
+	reports := []driftchecker.DriftReport{
 		{
-			InstanceID:      "i-123",
-			ApplicationName: "app1",
-			Drifts: []comparator.DriftDetail{
+			InstanceID: "i-123",
+			Name:       "app1",
+			Drifts: []driftchecker.DriftDetail{
 				{
 					Attribute:     "ami",
 					ExpectedValue: "ami-123",
@@ -66,16 +62,16 @@ func TestPrintTableMatchingValues(t *testing.T) {
 		output.PrintTable(reports)
 	})
 
-	assert.Contains(t, output, "INSTANCE ID\tAPPLICATION\tATTRIBUTE\tEXPECTED\tACTUAL")
-	assert.Regexp(t, `i-123\s+app1\s+ami\s+\x1b\[32mami-123\x1b\[0m\s+\x1b\[32mami-123\x1b\[0m`, output)
+	pattern := regexp.MustCompile(`i-123\s+app1\s+ami\s+\x1b\[32mami-123\x1b\[0m\s+\x1b\[32mami-123\x1b\[0m`)
+	assert.Regexp(t, pattern, output)
 }
 
 func TestPrintTableMismatchedValues(t *testing.T) {
-	reports := []comparator.DriftReport{
+	reports := []driftchecker.DriftReport{
 		{
-			InstanceID:      "i-456",
-			ApplicationName: "app2",
-			Drifts: []comparator.DriftDetail{
+			InstanceID: "i-456",
+			Name:       "app2",
+			Drifts: []driftchecker.DriftDetail{
 				{
 					Attribute:     "instance_type",
 					ExpectedValue: "t2.micro",
@@ -89,22 +85,16 @@ func TestPrintTableMismatchedValues(t *testing.T) {
 		output.PrintTable(reports)
 	})
 
-	expected := "\\x1b\\[33mt2\\.micro\\x1b\\[0m"
-	actual := "\\x1b\\[31mt3\\.micro\\x1b\\[0m"
-
-	pattern := regexp.MustCompile(
-		`i-456\s+app2\s+instance_type\s+` + expected + `\s+` + actual,
-	)
-
-	assert.Regexp(t, pattern, output)
+	expectedPattern := regexp.MustCompile(`i-456\s+app2\s+instance_type\s+\x1b\[33mt2\.micro\x1b\[0m\s+\x1b\[31mt3\.micro\x1b\[0m`)
+	assert.Regexp(t, expectedPattern, output)
 }
 
 func TestPrintTableMixedDrifts(t *testing.T) {
-	reports := []comparator.DriftReport{
+	reports := []driftchecker.DriftReport{
 		{
-			InstanceID:      "i-789",
-			ApplicationName: "app3",
-			Drifts: []comparator.DriftDetail{
+			InstanceID: "i-789",
+			Name:       "app3",
+			Drifts: []driftchecker.DriftDetail{
 				{
 					Attribute:     "ami",
 					ExpectedValue: "ami-match",
@@ -126,15 +116,15 @@ func TestPrintTableMixedDrifts(t *testing.T) {
 	assert.Contains(t, output, "\x1b[32mami-match\x1b[0m")
 	assert.Contains(t, output, "\x1b[33mt2.medium\x1b[0m")
 	assert.Contains(t, output, "\x1b[31mt3.medium\x1b[0m")
-	assert.True(t, strings.Index(output, "ami") < strings.Index(output, "instance_type"))
+	assert.True(t, strings.Index(output, "ami") < strings.Index(output, "instance_type"), "AMI should come first")
 }
 
 func TestPrintTableFormattingDifferentTypes(t *testing.T) {
-	reports := []comparator.DriftReport{
+	reports := []driftchecker.DriftReport{
 		{
-			InstanceID:      "i-0",
-			ApplicationName: "app0",
-			Drifts: []comparator.DriftDetail{
+			InstanceID: "i-0",
+			Name:       "app0",
+			Drifts: []driftchecker.DriftDetail{
 				{
 					Attribute:     "security_groups",
 					ExpectedValue: []string{"sg-1", "sg-2"},
@@ -160,20 +150,18 @@ func TestPrintTableFormattingDifferentTypes(t *testing.T) {
 
 	assert.Contains(t, output, "\x1b[33msg-1, sg-2\x1b[0m")
 	assert.Contains(t, output, "\x1b[31msg-3, sg-4\x1b[0m")
-
 	assert.Contains(t, output, "\x1b[33mtrue\x1b[0m")
 	assert.Contains(t, output, "\x1b[31mfalse\x1b[0m")
-
 	assert.Contains(t, output, "\x1b[33m2\x1b[0m")
 	assert.Contains(t, output, "\x1b[31m4\x1b[0m")
 }
 
 func TestPrintTableMultipleInstances(t *testing.T) {
-	reports := []comparator.DriftReport{
+	reports := []driftchecker.DriftReport{
 		{
-			InstanceID:      "i-111",
-			ApplicationName: "appA",
-			Drifts: []comparator.DriftDetail{
+			InstanceID: "i-111",
+			Name:       "appA",
+			Drifts: []driftchecker.DriftDetail{
 				{
 					Attribute:     "availability_zone",
 					ExpectedValue: "us-east-1a",
@@ -182,9 +170,9 @@ func TestPrintTableMultipleInstances(t *testing.T) {
 			},
 		},
 		{
-			InstanceID:      "i-222",
-			ApplicationName: "appB",
-			Drifts: []comparator.DriftDetail{
+			InstanceID: "i-222",
+			Name:       "appB",
+			Drifts: []driftchecker.DriftDetail{
 				{
 					Attribute:     "tags",
 					ExpectedValue: map[string]string{"Env": "prod"},
@@ -200,16 +188,17 @@ func TestPrintTableMultipleInstances(t *testing.T) {
 
 	assert.Contains(t, output, "i-111")
 	assert.Contains(t, output, "i-222")
-
-	assert.Contains(t, output, "map[Env:prod]")
-	assert.Contains(t, output, "map[Env:dev]")
+	assert.Contains(t, output, "\x1b[33mmap[Env:prod]\x1b[0m")
+	assert.Contains(t, output, "\x1b[31mmap[Env:dev]\x1b[0m")
 }
 
 func TestPrintTableEdgeCases(t *testing.T) {
 	t.Run("empty_string_values", func(t *testing.T) {
-		reports := []comparator.DriftReport{
+		reports := []driftchecker.DriftReport{
 			{
-				Drifts: []comparator.DriftDetail{
+				InstanceID: "i-empty",
+				Name:       "edgeApp",
+				Drifts: []driftchecker.DriftDetail{
 					{
 						Attribute:     "host_id",
 						ExpectedValue: "",
@@ -223,14 +212,16 @@ func TestPrintTableEdgeCases(t *testing.T) {
 			output.PrintTable(reports)
 		})
 
-		assert.Contains(t, output, "\x1b[33m\x1b[0m") // Empty expected value
+		assert.Contains(t, output, "\x1b[33m\x1b[0m")
 		assert.Contains(t, output, "\x1b[31mh-123\x1b[0m")
 	})
 
 	t.Run("zero_values", func(t *testing.T) {
-		reports := []comparator.DriftReport{
+		reports := []driftchecker.DriftReport{
 			{
-				Drifts: []comparator.DriftDetail{
+				InstanceID: "i-zero",
+				Name:       "zeroApp",
+				Drifts: []driftchecker.DriftDetail{
 					{
 						Attribute:     "threads_per_core",
 						ExpectedValue: 0,
