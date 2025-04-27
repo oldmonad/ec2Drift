@@ -1,42 +1,33 @@
 package main
 
 import (
-	"errors"
-	"log"
-	"os"
-
-	"github.com/oldmonad/ec2Drift.git/internal/comparator"
-	"github.com/oldmonad/ec2Drift.git/internal/config"
-	"github.com/oldmonad/ec2Drift.git/internal/output"
+	"github.com/joho/godotenv"
+	"github.com/oldmonad/ec2Drift/internal/app"
+	"github.com/oldmonad/ec2Drift/pkg/config/env"
+	"github.com/oldmonad/ec2Drift/pkg/logger"
+	"github.com/oldmonad/ec2Drift/pkg/ports/cli"
+	"go.uber.org/zap"
 )
 
 func main() {
-	cfg, err := config.NewFromFlags()
-	if err != nil {
-		log.Fatalf("Configuration error: %v", err)
+	if err := godotenv.Load(); err != nil {
+		panic("Error loading .env: " + err.Error())
 	}
 
-	if err := cfg.LoadAndValidate(); err != nil {
-		var missingErr config.ErrNoEC2Instances
-		if errors.As(err, &missingErr) {
-			log.Fatalf("Validation failed: %v", err)
-		}
-		log.Fatalf("Configuration error: %v", err)
+	generalCfg := env.LoadGeneralConfig()
+
+	logger.Init(generalCfg.DebugMode)
+	defer logger.Log.Sync()
+
+	if err := generalCfg.Validate(); err != nil {
+		logger.Log.Fatal("invalid configuration", zap.Error(err))
 	}
 
-	// Get instances and configurations
-	stateInstances := cfg.TerraformState.GetEC2Instances()
-	configs := cfg.TerraformConfig.GetConfigs()
+	appInstance := app.New(*generalCfg)
 
-	// Detect drifts
-	reports := comparator.DetectDrift(stateInstances, configs, cfg.Attributes)
+	rootCmd := cli.NewCommand(appInstance)
 
-	// Print results
-	if len(reports) > 0 {
-		output.PrintTable(reports)
-		os.Exit(1)
+	if err := rootCmd.Execute(); err != nil {
+		logger.Log.Fatal("command failed", zap.Error(err))
 	}
-
-	log.Println("No drifts detected")
-	os.Exit(0)
 }
