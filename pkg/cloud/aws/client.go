@@ -2,7 +2,6 @@ package aws
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsPkgConfig "github.com/aws/aws-sdk-go-v2/config"
@@ -12,6 +11,7 @@ import (
 	"github.com/oldmonad/ec2Drift/pkg/cloud"
 	config "github.com/oldmonad/ec2Drift/pkg/config/cloud"
 	awsConfig "github.com/oldmonad/ec2Drift/pkg/config/cloud/aws"
+	"github.com/oldmonad/ec2Drift/pkg/errors"
 )
 
 type EC2Client interface {
@@ -48,7 +48,7 @@ func (p *AWSProvider) FetchInstances(ctx context.Context, providerCfg config.Pro
 	awsCfgStruct, ok := providerCfg.(*awsConfig.Config)
 
 	if !ok {
-		return nil, fmt.Errorf("unexpected provider config type %T, want *aws.Config", providerCfg)
+		return nil, errors.NewWrongConfigType(providerCfg)
 	}
 
 	if p.EC2Client == nil {
@@ -63,7 +63,7 @@ func (p *AWSProvider) FetchInstances(ctx context.Context, providerCfg config.Pro
 			),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("unable to load AWS SDK config: %w", err)
+			return nil, errors.NewAWSConfigLoad(err)
 		}
 		p.EC2Client = ec2.NewFromConfig(awsCfg)
 	}
@@ -74,7 +74,7 @@ func (p *AWSProvider) FetchInstances(ctx context.Context, providerCfg config.Pro
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to describe instances: %w", err)
+			return nil, errors.NewDescribeInstances(err)
 		}
 
 		for _, reservation := range page.Reservations {
@@ -115,7 +115,13 @@ func getVolumeDetails(ctx context.Context, client EC2Client, volumeID string) Bl
 		VolumeIds: []string{volumeID},
 	}
 	volResult, err := client.DescribeVolumes(ctx, volInput)
-	if err != nil || len(volResult.Volumes) == 0 {
+	if err != nil {
+		_ = errors.NewDescribeVolumes(volumeID, err)
+		return BlockDevice{VolumeID: volumeID}
+	}
+
+	if len(volResult.Volumes) == 0 {
+		_ = errors.NewDescribeVolumes(volumeID, nil)
 		return BlockDevice{VolumeID: volumeID}
 	}
 
@@ -154,6 +160,7 @@ func mapToEC2Instance(ctx context.Context, instance types.Instance, client EC2Cl
 		e.SecurityGroups = append(e.SecurityGroups, aws.ToString(sg.GroupName))
 	}
 
+	found := false
 	for _, bd := range instance.BlockDeviceMappings {
 		if bd.Ebs != nil && aws.ToString(bd.DeviceName) == aws.ToString(instance.RootDeviceName) {
 			v := getVolumeDetails(ctx, client, aws.ToString(bd.Ebs.VolumeId))
@@ -163,8 +170,16 @@ func mapToEC2Instance(ctx context.Context, instance types.Instance, client EC2Cl
 				SizeGB:     v.SizeGB,
 				VolumeType: v.VolumeType,
 			}
+			found = true
 			break
 		}
+	}
+
+	if !found {
+		// no root device found, but this is unexpected
+		// no root device found → mapping failure
+		// (we return partial object but record the error for callers if desired)
+		_ = errors.NewMapInstance(e.InstanceID, "root device mapping not found")
 	}
 
 	return e

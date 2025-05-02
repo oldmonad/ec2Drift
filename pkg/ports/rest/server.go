@@ -2,144 +2,107 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
 	"net/http"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/oldmonad/ec2Drift/internal/app"
-	cerrors "github.com/oldmonad/ec2Drift/pkg/errors"
+	"github.com/oldmonad/ec2Drift/pkg/errors"
 	"github.com/oldmonad/ec2Drift/pkg/logger"
-	"github.com/oldmonad/ec2Drift/pkg/parser"
-	"github.com/oldmonad/ec2Drift/pkg/ports"
+	"github.com/oldmonad/ec2Drift/pkg/ports/rest/handlers"
+	"github.com/oldmonad/ec2Drift/pkg/utils/validator"
 	"go.uber.org/zap"
 )
 
-var (
-	HandleDriftCheck = handleDriftCheck
-)
-
-type HTTPServer interface {
-	ListenAndServe() error
-	Shutdown(ctx context.Context) error
+// Server defines the behavior for starting, stopping, and retrieving the address of an HTTP server.
+type Server interface {
+	Start(port string) error
+	Stop() error
+	Address() string
 }
 
-type standardHTTPServer struct {
-	*http.Server
+// HttpServer implements the Server interface and manages HTTP lifecycle and handlers.
+type HttpServer struct {
+	// This struct can also be extended to handle different
+	// kinds of handlers, not just this drift handler, and can act
+	// as a hub for HTTP server primitives, e.g. (*http.Server)
+	driftHandler *handlers.DriftHandler
+	server       *http.Server
+	stopCancel   context.CancelFunc
 }
 
-func (s *standardHTTPServer) ListenAndServe() error {
-	return s.Server.ListenAndServe()
+// NewServer creates a new instance of HttpServer with initialized drift handler.
+func NewServer(app app.AppRunner, validator validator.Validator) Server {
+	return &HttpServer{driftHandler: handlers.NewDriftHandler(app, validator)}
 }
 
-func (s *standardHTTPServer) Shutdown(ctx context.Context) error {
-	return s.Server.Shutdown(ctx)
-}
-
-var NewHTTPServer = func(addr string, handler http.Handler) HTTPServer {
-	return &standardHTTPServer{
-		Server: &http.Server{
-			Addr:    addr,
-			Handler: handler,
-		},
-	}
-}
-
-func StartServer(appInstance app.AppRunner, port string) error {
+// Start starts the HTTP server on the specified port,
+// initializes signal handling for graceful shutdown, and listens for requests.
+func (s *HttpServer) Start(port string) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/drift", func(w http.ResponseWriter, r *http.Request) {
-		handleDriftCheck(appInstance, w, r)
-	})
+	mux.HandleFunc("/drift", s.driftHandler.HandleDrift)
 
-	server := NewHTTPServer(":"+port, mux)
+	s.server = &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
 
+	// Set up context that listens for interrupt/termination signals.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	s.stopCancel = stop
 	defer stop()
 
-	logger.Log.Info("Starting HTTP server", zap.String("addr", ":"+port))
+	logger.Log.Info("Starting HTTP server", zap.String("addr", s.server.Addr))
 
 	errChan := make(chan error, 1)
+
+	// Start the server asynchronously and capture any unexpected errors.
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errChan <- fmt.Errorf("server error: %w", err)
+		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errChan <- errors.NewErrServerListen(s.server.Addr, err)
 		}
 	}()
 
+	// Block until either an error occurs or a shutdown signal is received.
 	select {
 	case err := <-errChan:
 		return err
 	case <-ctx.Done():
 		logger.Log.Info("Received shutdown signal, stopping server")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		return s.Stop()
+	}
+}
 
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Log.Error("Server shutdown failed", zap.Error(err))
-			return fmt.Errorf("shutdown error: %w", err)
-		}
+// Stop performs a graceful shutdown of the server,
+// allowing active requests up to 5 seconds to complete.
+func (s *HttpServer) Stop() error {
+	logger.Log.Info("Stopping HTTP server")
+	if s.stopCancel != nil {
+		s.stopCancel()
+	}
 
-		logger.Log.Info("Server stopped successfully")
+	if s.server == nil {
 		return nil
 	}
-}
-func handleDriftCheck(appInstance app.AppRunner, w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
+
+	// Timeout context to ensure server shuts down gracefully within time window.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := s.server.Shutdown(shutdownCtx); err != nil {
+		logger.Log.Error("Server shutdown failed", zap.Error(err))
+		return errors.NewErrServerShutdown(err)
 	}
-	var req struct {
-		Attrs  []string `json:"attributes"`
-		Format string   `json:"format"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
-		return
-	}
-	if req.Attrs == nil {
-		req.Attrs = []string{}
-	}
-	format := parser.Terraform
-	if req.Format == "json" {
-		format = parser.JSON
-	} else if req.Format != "" && req.Format != "terraform" {
-		format = parser.Terraform
-	}
-	err := appInstance.Run(r.Context(), req.Attrs, format, ports.HTTP)
-	if err != nil {
-		switch {
-		case strings.Contains(err.Error(), "drift detected"):
-			sendResponse(w, http.StatusOK, map[string]interface{}{
-				"drift_detected": true,
-				"message":        "Drift detected",
-			})
-		case errors.As(err, &cerrors.ErrNoEC2Instances{}):
-			sendError(w, http.StatusBadRequest, err.Error())
-		default:
-			sendError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to check drift: %v", err))
-		}
-		return
-	}
-	sendResponse(w, http.StatusOK, map[string]interface{}{
-		"drift_detected": false,
-		"message":        "No drift detected",
-	})
+
+	logger.Log.Info("Server stopped successfully")
+	return nil
 }
 
-func sendError(w http.ResponseWriter, statusCode int, message string) {
-	sendResponse(w, statusCode, map[string]interface{}{
-		"error": message,
-	})
-}
-
-// sendResponse sends a JSON response with the given status code and data
-func sendResponse(w http.ResponseWriter, statusCode int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+// Address returns the bind address of the HTTP server.
+func (s *HttpServer) Address() string {
+	if s.server != nil {
+		return s.server.Addr
 	}
+	return ""
 }

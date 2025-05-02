@@ -12,18 +12,23 @@ import (
 	"go.uber.org/zap"
 )
 
+// TestMain is the entry point for the test suite.
+// It sets a no-op logger to suppress logs during test execution.
 func TestMain(m *testing.M) {
 	logger.SetLogger(zap.NewNop())
 	os.Exit(m.Run())
 }
 
+// TestTerraformParser_Parse verifies the behavior of the TerraformParser's Parse method
+// under different HCL input scenarios.
 func TestTerraformParser_Parse(t *testing.T) {
+	// Define test cases
 	tests := []struct {
-		name        string
-		input       string
-		expected    []cloud.Instance
-		expectError bool
-		errorMsg    string
+		name        string           // Descriptive name of the test case
+		input       string           // HCL input to be parsed
+		expected    []cloud.Instance // Expected result after parsing
+		expectError bool             // Whether an error is expected
+		errorMsg    string           // Substring expected in the error message, if any
 	}{
 		{
 			name: "valid HCL with two EC2 instances",
@@ -114,7 +119,7 @@ resource "aws_instance" "db" {
 		  bucket = "my-bucket"
 		}
 		`,
-			expected:    []cloud.Instance{},
+			expected:    []cloud.Instance{}, // No EC2 instances expected
 			expectError: false,
 		},
 		{
@@ -166,21 +171,34 @@ resource "aws_instance" "db" {
 		},
 	}
 
+	// Iterate through test cases
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Create a new instance of the TerraformParser
 			parser := &parser.TerraformParser{}
+
+			// Call the parser with the provided HCL input
 			instances, err := parser.Parse([]byte(tt.input))
 
 			if tt.expectError {
+				// Assert that an error occurred
 				require.Error(t, err)
+
+				// If an expected error message is provided, verify it is contained in the actual error
 				if tt.errorMsg != "" {
 					assert.Contains(t, err.Error(), tt.errorMsg)
 				}
+
+				// Assert that result is nil when an error occurs
 				assert.Nil(t, instances)
 			} else {
+				// Assert that no error occurred
 				require.NoError(t, err)
+
+				// Ensure the number of parsed instances matches the expected number
 				require.Equal(t, len(tt.expected), len(instances), "number of instances mismatch")
 
+				// Compare each parsed instance with expected
 				for i, expected := range tt.expected {
 					actual := instances[i]
 					assert.Equal(t, expected.InstanceID, actual.InstanceID)

@@ -1,8 +1,9 @@
 package gcp
 
 import (
-	"fmt"
 	"os"
+
+	"github.com/oldmonad/ec2Drift/pkg/errors"
 )
 
 type Config struct {
@@ -20,8 +21,18 @@ func LoadConfig() *Config {
 }
 
 func (c *Config) Validate() error {
-	if c.ProjectID == "" || c.Region == "" {
-		return fmt.Errorf("missing GCP configuration")
+	var missing []string
+	if c.ProjectID == "" {
+		missing = append(missing, "GCP_PROJECT")
+	}
+	if c.Region == "" {
+		missing = append(missing, "GCP_REGION")
+	}
+	if c.CredentialsFile == "" {
+		missing = append(missing, "GOOGLE_APPLICATION_CREDENTIALS")
+	}
+	if len(missing) > 0 {
+		return errors.NewErrMissingGCPConfig(missing)
 	}
 	return nil
 }

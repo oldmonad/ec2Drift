@@ -19,116 +19,114 @@ import (
 )
 
 type App struct {
-	Logger             *zap.Logger
-	generalCfg         env.GeneralConfig
-	fetchInstancesFunc func(ctx context.Context, cfg config.ProviderConfig) ([]cloud.Instance, error)
-	parseFunc          func(content []byte) ([]cloud.Instance, error)
+	Logger         *zap.Logger
+	configurations env.Configurations
 }
 
+// AppRunner defines the contract for running the core application logic
 type AppRunner interface {
 	Run(ctx context.Context, attrs []string, format parser.ParserType, runtype ports.Runtype) error
 }
 
-func New(generalConfig env.GeneralConfig) *App {
-	return &App{Logger: logger.Log, generalCfg: generalConfig}
+// NewApp initializes and returns a new App instance
+func NewApp(configurations env.Configurations) *App {
+	return &App{Logger: logger.Log, configurations: configurations}
 }
 
-func NewTestable(
-	generalConfig env.GeneralConfig,
-	fetchInstancesFunc func(ctx context.Context, cfg config.ProviderConfig) ([]cloud.Instance, error),
-	parseFunc func(content []byte) ([]cloud.Instance, error),
-) *App {
-	app := New(generalConfig)
-	app.fetchInstancesFunc = fetchInstancesFunc
-	app.parseFunc = parseFunc
-
-	return app
+// Configurations returns the application's configuration settings
+func (a *App) Configurations() env.Configurations {
+	return a.configurations
 }
 
+// Run orchestrates the full drift detection workflow:
+// 1. Fetch current cloud state
+// 2. Load desired configuration from file
+// 3. Parse desired state
+// 4. Compare actual vs. desired and report drift
 func (a *App) Run(ctx context.Context, attrs []string, format parser.ParserType, runtype ports.Runtype) error {
-	statePath := a.generalCfg.StatePath
-	log := a.Logger.With(zap.String("component", "app"))
-	log.Info("Reading configuration file", zap.String("path", statePath))
-	content, err := os.ReadFile(statePath)
-
+	stateInstances, err := a.GetLiveStateInstances(ctx, a.configurations.CloudConfig)
 	if err != nil {
-		return errors.NewReadFileError(err)
+		return err
 	}
 
-	providerType := config.ProviderType(os.Getenv("CLOUD_PROVIDER"))
-	cloudCfg, err := config.NewProviderConfig(providerType)
-
+	content, err := a.LoadStateFile()
 	if err != nil {
-		log.Error("invalid cloud provider", zap.Error(err))
-		return errors.ErrInvalidCloudProvider{Provider: string(providerType)}
+		return err
 	}
 
-	if err := cloudCfg.Validate(); err != nil {
-		log.Error("cloud config validation failed", zap.Error(err))
-		return errors.ErrCloudConfigValidation{Reason: err.Error()}
-	}
-
-	var stateInstances []cloud.Instance
-	if a.fetchInstancesFunc != nil {
-		stateInstances, err = a.fetchInstancesFunc(ctx, cloudCfg)
-	} else {
-		var provider cloud.CloudProvider
-		switch providerType {
-		case config.AWS:
-			provider = &aws.AWSProvider{}
-		case config.GCP:
-			provider = &gcp.GCPProvider{}
-		default:
-			provider = &aws.AWSProvider{}
-		}
-		stateInstances, err = provider.FetchInstances(ctx, cloudCfg)
-	}
-
-	var configInstances []cloud.Instance
-	if a.parseFunc != nil {
-		configInstances, err = a.parseFunc(content)
-	} else {
-		var p parser.Parser
-		switch format {
-		case parser.Terraform:
-			p = &parser.TerraformParser{}
-		case parser.JSON:
-			p = &parser.JSONParser{}
-		default:
-			p = &parser.TerraformParser{}
-		}
-		configInstances, err = p.Parse(content)
-	}
-
+	configInstances, err := a.ParseConfigInstances(content, format)
 	if err != nil {
-		return errors.ErrParse{Err: err}
+		return err
 	}
 
-	if len(configInstances) == 0 {
-		return errors.ErrNoEC2Instances{Path: statePath}
-	}
+	return a.HandleDrift(ctx, stateInstances, configInstances, attrs, runtype)
+}
 
-	if len(attrs) == 0 {
-		attrs = []string{
-			"ami",
-			"instance_type",
-			"security_groups",
-			"tags",
-			"root_block_device.volume_size",
-			"root_block_device.volume_type",
-		}
+// LoadStateFile reads and returns the contents of the desired state configuration file
+// if I had more time, I would refactor this to use a more robust file reading mechanism
+// which would be part of a separate module that handles file and data operations
+func (a *App) LoadStateFile() ([]byte, error) {
+	path := a.configurations.StatePath
+	a.Logger.Info("Reading configuration file", zap.String("path", path))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		a.Logger.Error("Failed to read configuration file", zap.Error(err))
+		return nil, errors.NewReadFileError(err)
 	}
+	a.Logger.Info("Configuration file read successfully")
+	return data, nil
+}
+
+// GetLiveStateInstances orchestrates and sets the cloud provider instance data
+// And then proceeds to fetch the live state instances from the cloud provider
+func (a *App) GetLiveStateInstances(ctx context.Context, configurations config.ProviderConfig) ([]cloud.Instance, error) {
+	var provider cloud.CloudProvider
+	switch a.configurations.CloudProviderType {
+	case config.AWS:
+		provider = &aws.AWSProvider{}
+	case config.GCP:
+		provider = &gcp.GCPProvider{}
+	default:
+		// Default to AWS if provider is not specified
+		provider = &aws.AWSProvider{}
+	}
+	return provider.FetchInstances(ctx, configurations)
+}
+
+// ParseConfigInstances parses the desired configuration content into structured instance data
+func (a *App) ParseConfigInstances(content []byte, format parser.ParserType) ([]cloud.Instance, error) {
+	var p parser.Parser
+	switch format {
+	case parser.Terraform:
+		p = &parser.TerraformParser{}
+	case parser.JSON:
+		p = &parser.JSONParser{}
+	default:
+		// Default to Terraform parser if format is unrecognized
+		p = &parser.TerraformParser{}
+	}
+	return p.Parse(content)
+}
+
+// HandleDrift compares actual vs. desired instances and outputs the drift report
+func (a *App) HandleDrift(
+	ctx context.Context,
+	stateInstances, configInstances []cloud.Instance,
+	attrs []string,
+	runtype ports.Runtype,
+) error {
 	reports := driftchecker.Detect(ctx, stateInstances, configInstances, attrs)
 	if len(reports) > 0 {
-		log.Info("Drift detected", zap.Int("report_count", len(reports)))
+		a.Logger.Info("Drift detected", zap.Int("report_count", len(reports)))
 		output.PrintTable(reports)
+
+		// In CLI mode, exit after printing drift
 		if runtype == ports.CLI {
 			os.Exit(0)
 		}
-
 		return errors.NewDriftDetected()
 	}
 
-	log.Info("No drift detected")
+	a.Logger.Info("No drift detected")
 	return nil
 }

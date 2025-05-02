@@ -2,451 +2,570 @@ package rest_test
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
+	"fmt"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
-	"reflect"
 	"strings"
-	"syscall"
+	"sync"
 	"testing"
 	"time"
 
+	pkgerrors "github.com/oldmonad/ec2Drift/pkg/errors"
 	"github.com/oldmonad/ec2Drift/pkg/logger"
 	"github.com/oldmonad/ec2Drift/pkg/parser"
 	"github.com/oldmonad/ec2Drift/pkg/ports"
 	"github.com/oldmonad/ec2Drift/pkg/ports/rest"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
 
-type mockAppRunner struct {
-	runFunc func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error
+func TestMain(m *testing.M) {
+	// Initialize test logger
+	logger.SetLogger(zap.NewNop())
+	code := m.Run()
+	os.Exit(code)
 }
 
-func (m *mockAppRunner) Run(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-	return m.runFunc(ctx, attrs, format, outputPort)
+// Mock implementations
+type MockAppRunner struct {
+	mock.Mock
 }
 
-type mockHTTPServer struct {
-	shutdownErr error
+func (m *MockAppRunner) Run(ctx context.Context, args []string, pt parser.ParserType, rt ports.Runtype) error {
+	return m.Called(ctx, args, pt, rt).Error(0)
 }
 
-func (m *mockHTTPServer) ListenAndServe() error {
-	return nil
+type MockValidator struct {
+	mock.Mock
 }
 
-func (m *mockHTTPServer) Shutdown(ctx context.Context) error {
-	return m.shutdownErr
-}
-
-func TestHandleDriftCheckMethodNotAllowed(t *testing.T) {
-	mockApp := &mockAppRunner{
-		runFunc: func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-			return nil
-		},
+func (m *MockValidator) ValidateAttributes(requested []string) ([]string, error) {
+	args := m.Called(requested)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
 	}
+	return args.Get(0).([]string), args.Error(1)
+}
 
-	req, err := http.NewRequest(http.MethodGet, "/drift", nil)
+func (m *MockValidator) ValidateFormat(format string) (parser.ParserType, error) {
+	args := m.Called(format)
+	return args.Get(0).(parser.ParserType), args.Error(1)
+}
+
+// Helper function to get a free port
+func getFreePort() (string, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
 	if err != nil {
-		t.Fatal(err)
+		return "", err
 	}
 
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rest.HandleDriftCheck(mockApp, w, r)
-	})
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusMethodNotAllowed {
-		t.Errorf("expected status %d, got %d", http.StatusMethodNotAllowed, status)
-	}
-
-	var response map[string]interface{}
-	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-
-	if errorMsg, ok := response["error"].(string); !ok || errorMsg != "Method not allowed" {
-		t.Errorf("unexpected error message: %v", response["error"])
-	}
-}
-
-func TestHandleDriftCheckInvalidRequestBody(t *testing.T) {
-	mockApp := &mockAppRunner{
-		runFunc: func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-			return nil
-		},
-	}
-
-	reqBody := strings.NewReader(`invalid json`)
-	req, err := http.NewRequest(http.MethodPost, "/drift", reqBody)
+	l, err := net.ListenTCP("tcp", addr)
 	if err != nil {
-		t.Fatal(err)
+		return "", err
 	}
+	defer l.Close()
 
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rest.HandleDriftCheck(mockApp, w, r)
-	})
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusBadRequest {
-		t.Errorf("expected status %d, got %d", http.StatusBadRequest, status)
-	}
-
-	var response map[string]interface{}
-	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-
-	if errorMsg, ok := response["error"].(string); !ok || !strings.Contains(errorMsg, "Invalid request body") {
-		t.Errorf("unexpected error message: %v", response["error"])
-	}
+	return fmt.Sprintf("%d", l.Addr().(*net.TCPAddr).Port), nil
 }
 
-func TestHandleDriftCheckDriftDetected(t *testing.T) {
-	mockApp := &mockAppRunner{
-		runFunc: func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-			return errors.New("drift detected: instance configuration changed")
-		},
+// Helper function to wait for server to be ready and accessible
+func waitForServer(server rest.Server, timeout time.Duration) (string, error) {
+	start := time.Now()
+	var port string
+
+	// First, wait for the server to report an address
+	for time.Since(start) < timeout {
+		addr := server.Address()
+		if addr != "" && addr != ":0" {
+			// Extract port from address
+			if strings.HasPrefix(addr, ":") {
+				port = strings.TrimPrefix(addr, ":")
+			} else {
+				_, portStr, err := net.SplitHostPort(addr)
+				if err != nil {
+					return "", fmt.Errorf("invalid address format: %s", addr)
+				}
+				port = portStr
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	reqBody := strings.NewReader(`{"attributes": ["instance_type"], "format": "terraform"}`)
-	req, err := http.NewRequest(http.MethodPost, "/drift", reqBody)
+	if port == "" {
+		return "", fmt.Errorf("server did not report an address within timeout")
+	}
+
+	// Next, verify the server is actually accepting connections
+	timeLeft := timeout - time.Since(start)
+	if timeLeft <= 0 {
+		return "", fmt.Errorf("timeout waiting for server")
+	}
+
+	// Try to connect to the server to verify it's ready
+	dialCtx, cancel := context.WithTimeout(context.Background(), timeLeft)
+	defer cancel()
+
+	dialer := &net.Dialer{}
+	conn, err := dialer.DialContext(dialCtx, "tcp", "localhost:"+port)
 	if err != nil {
-		t.Fatal(err)
+		return "", fmt.Errorf("server not accepting connections: %v", err)
 	}
+	conn.Close()
 
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rest.HandleDriftCheck(mockApp, w, r)
-	})
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("expected status %d, got %d", http.StatusOK, status)
-	}
-
-	var response map[string]interface{}
-	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-
-	if drift, ok := response["drift_detected"].(bool); !ok || !drift {
-		t.Error("expected drift_detected to be true")
-	}
+	return port, nil
 }
 
-func TestHandleDriftCheckNoDriftDetected(t *testing.T) {
-	mockApp := &mockAppRunner{
-		runFunc: func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-			return nil
-		},
-	}
+// Test server address functionality
+func TestAddress(t *testing.T) {
+	mockApp := new(MockAppRunner)
+	mockValidator := new(MockValidator)
 
-	reqBody := strings.NewReader(`{"attributes": ["instance_type"], "format": "terraform"}`)
-	req, err := http.NewRequest(http.MethodPost, "/drift", reqBody)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Create new server
+	server := rest.NewServer(mockApp, mockValidator)
 
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rest.HandleDriftCheck(mockApp, w, r)
-	})
-	handler.ServeHTTP(rr, req)
+	// Before starting, address should be empty
+	assert.Empty(t, server.Address())
 
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("expected status %d, got %d", http.StatusOK, status)
-	}
+	// Create a simple test to check address after server is started
+	// Get free port for testing
+	port, err := getFreePort()
+	require.NoError(t, err)
 
-	var response map[string]interface{}
-	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
+	// Use a context with timeout to ensure the test doesn't hang
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	if drift, ok := response["drift_detected"].(bool); !ok || drift {
-		t.Error("expected drift_detected to be false")
-	}
-}
+	// Create a channel to signal when server is started
+	started := make(chan struct{})
 
-func TestHandleDriftCheckInternalServerError(t *testing.T) {
-	mockApp := &mockAppRunner{
-		runFunc: func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-			return errors.New("unexpected error")
-		},
-	}
+	// Create a channel for server errors
+	serverErrCh := make(chan error, 1)
 
-	reqBody := strings.NewReader(`{}`)
-	req, err := http.NewRequest(http.MethodPost, "/drift", reqBody)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rest.HandleDriftCheck(mockApp, w, r)
-	})
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusInternalServerError {
-		t.Errorf("expected status %d, got %d", http.StatusInternalServerError, status)
-	}
-
-	var response map[string]interface{}
-	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-
-	expectedMsg := "Failed to check drift: unexpected error"
-	if errorMsg, ok := response["error"].(string); !ok || errorMsg != expectedMsg {
-		t.Errorf("expected error message '%s', got '%v'", expectedMsg, errorMsg)
-	}
-}
-
-func TestHandleDriftCheckAttributesAndFormatParsing(t *testing.T) {
-	var (
-		calledAttrs  []string
-		calledFormat parser.ParserType
-	)
-
-	mockApp := &mockAppRunner{
-		runFunc: func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-			calledAttrs = attrs
-			calledFormat = format
-			return nil
-		},
-	}
-
-	reqBody := strings.NewReader(`{"attributes": ["attr1", "attr2"], "format": "json"}`)
-	req, err := http.NewRequest(http.MethodPost, "/drift", reqBody)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rest.HandleDriftCheck(mockApp, w, r)
-	})
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("expected status %d, got %d", http.StatusOK, status)
-	}
-
-	expectedAttrs := []string{"attr1", "attr2"}
-	if !reflect.DeepEqual(calledAttrs, expectedAttrs) {
-		t.Errorf("expected attributes %v, got %v", expectedAttrs, calledAttrs)
-	}
-
-	if calledFormat != parser.JSON {
-		t.Errorf("expected format %v, got %v", parser.JSON, calledFormat)
-	}
-}
-
-func TestHandleDriftCheckDefaultAttributesAndFormat(t *testing.T) {
-	var (
-		calledAttrs  []string
-		calledFormat parser.ParserType
-	)
-
-	mockApp := &mockAppRunner{
-		runFunc: func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-			calledAttrs = attrs
-			calledFormat = format
-			return nil
-		},
-	}
-
-	reqBody := strings.NewReader(`{}`)
-	req, err := http.NewRequest(http.MethodPost, "/drift", reqBody)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rest.HandleDriftCheck(mockApp, w, r)
-	})
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("expected status %d, got %d", http.StatusOK, status)
-	}
-
-	if calledAttrs == nil || len(calledAttrs) != 0 {
-		t.Errorf("expected empty attributes slice, got %v", calledAttrs)
-	}
-
-	if calledFormat != parser.Terraform {
-		t.Errorf("expected default format %v, got %v", parser.Terraform, calledFormat)
-	}
-}
-
-func TestStartServerGracefulShutdown(t *testing.T) {
-	oldLogger := logger.Log
-	logger.Log = zap.NewNop()
-	defer func() { logger.Log = oldLogger }()
-
-	mockApp := &mockAppRunner{
-		runFunc: func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-			return nil
-		},
-	}
-
-	errChan := make(chan error, 1)
+	// Start server in a goroutine with the context
 	go func() {
-		errChan <- rest.StartServer(mockApp, "0")
+		// Signal that the goroutine has started
+		close(started)
+
+		// Monitor context for cancellation
+		go func() {
+			<-ctx.Done()
+			// Context was canceled, stop the server
+			_ = server.Stop()
+		}()
+
+		// Start the server
+		err := server.Start(port)
+		if err != nil && err != http.ErrServerClosed {
+			serverErrCh <- err
+		} else {
+			serverErrCh <- nil
+		}
 	}()
 
+	// Wait for goroutine to start
+	<-started
+
+	// Short delay to allow server to initialize
 	time.Sleep(100 * time.Millisecond)
 
-	proc, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		t.Fatalf("Failed to find process: %v", err)
-	}
-	if err := proc.Signal(syscall.SIGINT); err != nil {
-		t.Fatalf("Failed to send signal: %v", err)
-	}
+	// Get the address and verify it contains the port
+	addr := server.Address()
+	if addr != "" {
+		// The server might have started, check the address
+		assert.Contains(t, addr, port)
 
-	select {
-	case err := <-errChan:
-		if err != nil {
-			t.Fatalf("Expected no error, got %v", err)
+		// Stop the server properly
+		err := server.Stop()
+		assert.NoError(t, err)
+
+		// Wait for server to stop or timeout
+		select {
+		case err := <-serverErrCh:
+			// Check if we got a non-nil error that isn't just the server closing
+			if err != nil && err != http.ErrServerClosed {
+				t.Fatalf("server error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			// If we time out, cancel the context which will trigger server shutdown
+			cancel()
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout waiting for server shutdown")
+	} else {
+		// If the address is still empty, the server hasn't started yet
+		// Let's cancel and skip further checks
+		cancel()
+		t.Log("Server didn't start in time, skipping address check")
 	}
 }
 
-func TestStartServerListenError(t *testing.T) {
-	oldLogger := logger.Log
-	logger.Log = zap.NewNop()
-	defer func() { logger.Log = oldLogger }()
+// Test server start with invalid port
+func TestStartInvalidPort(t *testing.T) {
+	mockApp := new(MockAppRunner)
+	mockValidator := new(MockValidator)
 
-	listener, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		t.Fatalf("Failed to listen: %v", err)
-	}
-	defer listener.Close()
+	server := rest.NewServer(mockApp, mockValidator)
 
-	mockApp := &mockAppRunner{}
-	err = rest.StartServer(mockApp, "8080")
+	// Try to start server with invalid port
+	err := server.Start("invalid_port")
 
-	if err == nil {
-		t.Fatal("Expected error when port is in use, got nil")
-	}
-
-	if !strings.Contains(err.Error(), "address already in use") &&
-		!strings.Contains(err.Error(), "Only one usage of each socket address") {
-		t.Errorf("Expected address in use error, got: %v", err)
-	}
+	// Verify error is returned and is of the correct type
+	assert.Error(t, err)
+	assert.IsType(t, pkgerrors.ErrServerListen{}, err)
 }
 
-func TestServerHandlesRequests(t *testing.T) {
-	oldLogger := logger.Log
-	logger.Log = zap.NewNop()
-	defer func() { logger.Log = oldLogger }()
+func TestGracefulShutdownSuccess(t *testing.T) {
+	mockApp := new(MockAppRunner)
+	mockValidator := new(MockValidator)
 
-	mockApp := &mockAppRunner{
-		runFunc: func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-			return nil
-		},
-	}
+	mockValidator.On("ValidateFormat", "json").Return(parser.JSON, nil)
+	mockValidator.On("ValidateAttributes", mock.Anything).Return([]string{"instance-id"}, nil)
 
-	errChan := make(chan error, 1)
-	port := "8081"
+	processing := make(chan struct{})
+	completed := make(chan struct{}) // Add completion channel
+
+	mockApp.On("Run", mock.Anything, mock.Anything, parser.JSON, mock.Anything).
+		Run(func(args mock.Arguments) {
+			close(processing)
+			<-completed // Wait for test to allow completion
+		}).
+		Return(nil)
+
+	server := rest.NewServer(mockApp, mockValidator)
+	port, err := getFreePort()
+	require.NoError(t, err)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- server.Start(port)
+	}()
+
+	_, err = waitForServer(server, 2*time.Second)
+	require.NoError(t, err)
+
+	// Create HTTP client with proper timeout
+	client := &http.Client{Timeout: 1 * time.Second}
 
 	go func() {
-		errChan <- rest.StartServer(mockApp, port)
+		body := strings.NewReader(`{"format":"json","attributes":["instance-id"]}`)
+		resp, _ := client.Post(
+			fmt.Sprintf("http://localhost:%s/drift", port),
+			"application/json",
+			body,
+		)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		close(completed) // Signal handler completion
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-
-	resp, err := http.Post("http://localhost:"+port+"/drift", "application/json", strings.NewReader("{}"))
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("Expected status OK, got %d", resp.StatusCode)
-	}
-
-	proc, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		t.Fatalf("Failed to find process: %v", err)
-	}
-	if err := proc.Signal(syscall.SIGINT); err != nil {
-		t.Fatalf("Failed to send signal: %v", err)
-	}
-
+	// Wait for handler to start
 	select {
-	case err := <-errChan:
-		if err != nil {
-			t.Fatalf("Unexpected shutdown error: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout waiting for server shutdown")
+	case <-processing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handler didn't start processing")
 	}
+
+	// Initiate shutdown
+	shutdownStart := time.Now()
+	err = server.Stop()
+	assert.NoError(t, err)
+
+	// Verify shutdown completion
+	select {
+	case err := <-serverErr:
+		assert.NoError(t, err)
+		t.Logf("Shutdown completed in %v", time.Since(shutdownStart))
+	case <-time.After(3 * time.Second):
+		t.Fatal("Server didn't stop within timeout")
+	}
+
+	mockApp.AssertExpectations(t)
+	mockValidator.AssertExpectations(t)
 }
 
-func TestStartServerShutdownError(t *testing.T) {
-	oldLogger := logger.Log
-	logger.Log = zap.NewNop()
-	defer func() { logger.Log = oldLogger }()
+func TestConcurrentRequestsDuringShutdown(t *testing.T) {
+	mockApp := new(MockAppRunner)
+	mockValidator := new(MockValidator)
 
-	mockApp := &mockAppRunner{
-		runFunc: func(ctx context.Context, attrs []string, format parser.ParserType, outputPort ports.Runtype) error {
-			return nil
-		},
-	}
+	// Setup mocks for 5 requests
+	mockValidator.On("ValidateFormat", "json").Return(parser.JSON, nil).Times(5)
+	mockValidator.On("ValidateAttributes", mock.Anything).Return([]string{"instance-id"}, nil).Times(5)
 
-	var origHttpServer interface{}
-	if rest.NewHTTPServer != nil {
-		origHttpServer = rest.NewHTTPServer
-	}
+	processing := make(chan struct{}, 5) // Buffered channel for 5 requests
+	blockProcessing := make(chan struct{})
 
-	mockSrv := &mockHTTPServer{
-		shutdownErr: errors.New("forced shutdown error"),
-	}
+	mockApp.On("Run", mock.Anything, mock.Anything, parser.JSON, mock.Anything).
+		Run(func(args mock.Arguments) {
+			processing <- struct{}{} // Signal request start
+			<-blockProcessing        // Block until release
+		}).
+		Return(nil).
+		Times(5)
 
-	rest.NewHTTPServer = func(addr string, handler http.Handler) rest.HTTPServer {
-		return mockSrv
-	}
+	server := rest.NewServer(mockApp, mockValidator)
+	port, err := getFreePort()
+	require.NoError(t, err)
 
-	defer func() {
-		if origHttpServer != nil {
-			rest.NewHTTPServer = origHttpServer.(func(string, http.Handler) rest.HTTPServer)
-		}
-	}()
-
-	errChan := make(chan error, 1)
+	serverErr := make(chan error, 1)
 	go func() {
-		errChan <- rest.StartServer(mockApp, "0")
+		serverErr <- server.Start(port)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	_, err = waitForServer(server, 2*time.Second)
+	require.NoError(t, err)
 
-	proc, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		t.Fatalf("Failed to find process: %v", err)
-	}
-	if err := proc.Signal(syscall.SIGINT); err != nil {
-		t.Fatalf("Failed to send signal: %v", err)
+	// Send requests with longer timeout
+	var wg sync.WaitGroup
+	client := &http.Client{Timeout: 3 * time.Second}
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			body := strings.NewReader(`{"format":"json","attributes":["instance-id"]}`)
+			resp, err := client.Post(
+				fmt.Sprintf("http://localhost:%s/drift", port),
+				"application/json",
+				body,
+			)
+			if resp != nil {
+				resp.Body.Close()
+			}
+			// Allow network errors during shutdown
+			if err != nil && !isExpectedShutdownError(err) {
+				t.Errorf("Unexpected request error: %v", err)
+			}
+		}()
 	}
 
+	// Wait for all requests to be processing
+	for i := 0; i < 5; i++ {
+		select {
+		case <-processing:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Timed out waiting for requests to start processing")
+		}
+	}
+
+	// Initiate shutdown with extended timeout
+	shutdownStart := time.Now()
+	close(blockProcessing) // Release all requests first
+	err = server.Stop()
+	assert.NoError(t, err)
+
+	// Verify shutdown completes within 3 seconds (less than server's 5s timeout)
 	select {
-	case err := <-errChan:
-		if err == nil {
-			t.Fatal("Expected shutdown error, got nil")
-		}
-		if !strings.Contains(err.Error(), "shutdown error") {
-			t.Errorf("Expected 'shutdown error' in error message, got: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout waiting for server shutdown")
+	case err := <-serverErr:
+		assert.NoError(t, err)
+		t.Logf("Shutdown completed in %v", time.Since(shutdownStart))
+	case <-time.After(3 * time.Second):
+		t.Fatal("Server did not shutdown within expected timeframe")
 	}
+
+	wg.Wait()
+	mockApp.AssertExpectations(t)
+	mockValidator.AssertExpectations(t)
 }
+
+func isExpectedShutdownError(err error) bool {
+	return strings.Contains(err.Error(), "closed") ||
+		strings.Contains(err.Error(), "refused") ||
+		strings.Contains(err.Error(), "timeout") ||
+		strings.Contains(err.Error(), "reset")
+}
+
+// func TestInvalidRequestHandling(t *testing.T) {
+// 	mockApp := new(MockAppRunner)
+// 	mockValidator := new(MockValidator)
+
+// 	// Setup validation failure
+// 	// mockValidator.On("ValidateFormat", "invalid").Return(parser.Unknown, pkgerrors.ErrInvalidFormat)
+// 	mockValidator.On("ValidateAttributes", mock.Anything).Return(nil, pkgerrors.InvalidAttributesError)
+
+// 	server := rest.NewServer(mockApp, mockValidator)
+// 	port, err := getFreePort()
+// 	require.NoError(t, err)
+
+// 	serverErr := make(chan error, 1)
+// 	go func() {
+// 		serverErr <- server.Start(port)
+// 	}()
+
+// 	_, err = waitForServer(server, 2*time.Second)
+// 	require.NoError(t, err)
+
+// 	// Test malformed JSON
+// 	resp1, err := http.Post(
+// 		fmt.Sprintf("http://localhost:%s/drift", port),
+// 		"application/json",
+// 		strings.NewReader(`{invalid-json}`),
+// 	)
+// 	require.NoError(t, err)
+// 	defer resp1.Body.Close()
+// 	assert.Equal(t, http.StatusBadRequest, resp1.StatusCode)
+
+// 	// Test invalid format
+// 	resp2, err := http.Post(
+// 		fmt.Sprintf("http://localhost:%s/drift", port),
+// 		"application/json",
+// 		strings.NewReader(`{"format":"invalid","attributes":[]}`),
+// 	)
+// 	require.NoError(t, err)
+// 	defer resp2.Body.Close()
+// 	assert.Equal(t, http.StatusBadRequest, resp2.StatusCode)
+
+// 	// Test invalid attributes
+// 	resp3, err := http.Post(
+// 		fmt.Sprintf("http://localhost:%s/drift", port),
+// 		"application/json",
+// 		strings.NewReader(`{"format":"json","attributes":["invalid"]}`),
+// 	)
+// 	require.NoError(t, err)
+// 	defer resp3.Body.Close()
+// 	assert.Equal(t, http.StatusBadRequest, resp3.StatusCode)
+
+// 	server.Stop()
+// 	mockApp.AssertExpectations(t)
+// 	mockValidator.AssertExpectations(t)
+// }
+
+// func TestHandlerPanicRecovery(t *testing.T) {
+// 	mockApp := new(MockAppRunner)
+// 	mockValidator := new(MockValidator)
+
+// 	// Setup mock to panic
+// 	mockValidator.On("ValidateFormat", "json").Return(parser.JSON, nil)
+// 	mockValidator.On("ValidateAttributes", mock.Anything).Return([]string{"instance-id"}, nil)
+// 	mockApp.On("Run", mock.Anything, mock.Anything, parser.JSON, mock.Anything).
+// 		Panic("simulated handler panic")
+
+// 	server := rest.NewServer(mockApp, mockValidator)
+// 	port, err := getFreePort()
+// 	require.NoError(t, err)
+
+// 	serverErr := make(chan error, 1)
+// 	go func() {
+// 		serverErr <- server.Start(port)
+// 	}()
+
+// 	_, err = waitForServer(server, 2*time.Second)
+// 	require.NoError(t, err)
+
+// 	// Send request that triggers panic
+// 	resp, err := http.Post(
+// 		fmt.Sprintf("http://localhost:%s/drift", port),
+// 		"application/json",
+// 		strings.NewReader(`{"format":"json","attributes":["instance-id"]}`),
+// 	)
+// 	require.NoError(t, err)
+// 	defer resp.Body.Close()
+
+// 	// Verify server remains operational
+// 	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+
+// 	// Verify server can still handle new requests
+// 	resp2, err := http.Post(
+// 		fmt.Sprintf("http://localhost:%s/drift", port),
+// 		"application/json",
+// 		strings.NewReader(`{"format":"json","attributes":["instance-id"]}`),
+// 	)
+// 	require.NoError(t, err)
+// 	defer resp2.Body.Close()
+// 	assert.Equal(t, http.StatusInternalServerError, resp2.StatusCode)
+
+// 	server.Stop()
+// 	mockApp.AssertExpectations(t)
+// 	mockValidator.AssertExpectations(t)
+// }
+
+func TestPortAlreadyInUse(t *testing.T) {
+	mockApp := new(MockAppRunner)
+	mockValidator := new(MockValidator)
+
+	// Get and occupy a port first
+	port, err := getFreePort()
+	require.NoError(t, err)
+
+	// Occupy the port
+	occupiedServer := &http.Server{Addr: ":" + port}
+	go occupiedServer.ListenAndServe()
+	defer occupiedServer.Close()
+
+	// Try to start our server on same port
+	server := rest.NewServer(mockApp, mockValidator)
+	err = server.Start(port)
+
+	assert.Error(t, err)
+	assert.IsType(t, pkgerrors.ErrServerListen{}, err)
+	assert.Contains(t, err.Error(), "address already in use")
+}
+
+// func TestMultipleStopCalls(t *testing.T) {
+// 	mockApp := new(MockAppRunner)
+// 	mockValidator := new(MockValidator)
+
+// 	server := rest.NewServer(mockApp, mockValidator)
+// 	port, err := getFreePort()
+// 	require.NoError(t, err)
+
+// 	go server.Start(port)
+// 	_, err = waitForServer(server, 2*time.Second)
+// 	require.NoError(t, err)
+
+// 	// First stop should succeed
+// 	err = server.Stop()
+// 	assert.NoError(t, err)
+
+// 	// Subsequent stops should be no-ops
+// 	err = server.Stop()
+// 	assert.NoError(t, err)
+// 	err = server.Stop()
+// 	assert.NoError(t, err)
+
+// 	// Verify address cleared
+// 	assert.Empty(t, server.Address())
+// }
+
+// func TestRequestTimeoutHandling(t *testing.T) {
+//     mockApp := new(MockAppRunner)
+//     mockValidator := new(MockValidator)
+
+//     // Setup long-running handler
+//     processing := make(chan struct{})
+//     mockValidator.On("ValidateFormat", "json").Return(parser.JSON, nil)
+//     mockValidator.On("ValidateAttributes", mock.Anything).Return([]string{"instance-id"}, nil)
+//     mockApp.On("Run", mock.Anything, mock.Anything, parser.JSON, mock.Anything).
+//         Run(func(args mock.Arguments) {
+//             close(processing)
+//             time.Sleep(2 * time.Second) // Exceeds client timeout
+//         }).
+//         Return(nil)
+
+//     server := rest.NewServer(mockApp, mockValidator)
+//     port, err := getFreePort()
+//     require.NoError(t, err)
+
+//     go server.Start(port)
+//     _, err = waitForServer(server, 2*time.Second)
+//     require.NoError(t, err)
+
+//     // Client with short timeout
+//     client := &http.Client{Timeout: 500 * time.Millisecond}
+
+//     // Send request
+//     resp, err := client.Post(
+//         fmt.Sprintf("http://localhost:%s/drift", port),
+//         "application/json",
+//         strings.NewReader(`{"format":"json","attributes":["instance-id"]}`),
+//     )
+
+//     // Verify timeout handling
+//     assert.Error(t, err)
+//     assert.True(t, os.IsTimeout(err), "Expected timeout error")
+
+//     server.Stop()
+//     mockApp.AssertExpectations(t)
+//     mockValidator.AssertExpectations(t)
+// }

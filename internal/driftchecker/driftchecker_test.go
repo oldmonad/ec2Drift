@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// There is just too much code here to comment due to time contraints, so we'll just skip the comments for brevity.
 func createInstance(name, id, ami, instanceType string, securityGroups []string, tags map[string]string, volumeSize int, volumeType string) cloud.Instance {
 	inst := cloud.Instance{
 		InstanceID:     id,

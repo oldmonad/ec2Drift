@@ -1,11 +1,12 @@
 package aws
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/oldmonad/ec2Drift/pkg/errors"
 	"github.com/oldmonad/ec2Drift/pkg/logger"
+	"go.uber.org/zap"
 )
 
 type Config struct {
@@ -25,10 +26,24 @@ func LoadConfig() *Config {
 }
 
 func (c *Config) Validate() error {
-	if c.AccessKey == "" || c.SecretKey == "" || c.Region == "" {
-		errMsg := "Missing AWS credentials: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, or AWS_REGION"
-		logger.Log.Error(errMsg)
-		return fmt.Errorf(errMsg)
+	var missing []string
+	if c.AccessKey == "" {
+		missing = append(missing, "AWS_ACCESS_KEY_ID")
+	}
+	if c.SecretKey == "" {
+		missing = append(missing, "AWS_SECRET_ACCESS_KEY")
+	}
+	if c.Region == "" {
+		missing = append(missing, "AWS_REGION")
+	}
+
+	if c.SessionToken == "" {
+		missing = append(missing, "AWS_SESSION_TOKEN")
+	}
+
+	if len(missing) > 0 {
+		logger.Log.Error("AWS config validation failed", zap.Strings("missing", missing))
+		return errors.NewErrMissingCredentials(missing)
 	}
 	return nil
 }

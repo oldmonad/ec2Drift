@@ -2,196 +2,303 @@ package cli_test
 
 import (
 	"context"
-	"reflect"
+	"errors"
+	"strings"
 	"testing"
 
-	"github.com/oldmonad/ec2Drift/internal/app"
 	"github.com/oldmonad/ec2Drift/pkg/config/env"
 	"github.com/oldmonad/ec2Drift/pkg/parser"
 	"github.com/oldmonad/ec2Drift/pkg/ports"
 	"github.com/oldmonad/ec2Drift/pkg/ports/cli"
-	"github.com/spf13/cobra"
-	"go.uber.org/zap"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
-type mockApp struct {
-	lastFormat parser.ParserType
-	lastAttrs  []string
+// Mock AppRunner simulates the application runner for testing purposes
+type MockAppRunner struct {
+	mock.Mock
 }
 
-func (m *mockApp) Run(ctx context.Context, attrs []string, format parser.ParserType, runtype ports.Runtype) error {
-	m.lastAttrs = attrs
-	m.lastFormat = format
-	return nil
+// Run simulates the Run method of the application runner
+func (m *MockAppRunner) Run(ctx context.Context, attrs []string, format parser.ParserType, output ports.Runtype) error {
+	args := m.Called(ctx, attrs, format, output)
+	return args.Error(0)
 }
 
-func TestNewCommand(t *testing.T) {
-	appInstance := app.New(env.GeneralConfig{})
-	cmd := cli.NewCommand(appInstance)
-
-	subs := cmd.Commands()
-	if len(subs) != 2 {
-		t.Fatalf("Expected 2 subcommands, got %d", len(subs))
-	}
-
-	runCmd := getCommand(cmd, "run")
-	if runCmd == nil {
-		t.Fatal("'run' subcommand not found")
-	}
-	checkFlag(t, runCmd, "format")
-	checkFlag(t, runCmd, "attributes")
-
-	serveCmd := getCommand(cmd, "serve")
-	if serveCmd == nil {
-		t.Fatal("'serve' subcommand not found")
-	}
-	checkFlag(t, serveCmd, "port")
+// Mock Validator simulates the validator for testing purposes
+type MockValidator struct {
+	mock.Mock
 }
 
-func TestServeCommandPortFlag(t *testing.T) {
-	appInstance := app.New(env.GeneralConfig{})
-	appInstance.Logger = zap.NewNop()
+// ValidateFormat simulates validating the format input
+func (m *MockValidator) ValidateFormat(format string) (parser.ParserType, error) {
+	args := m.Called(format)
+	return args.Get(0).(parser.ParserType), args.Error(1)
+}
 
-	originalStarter := cli.ServerStarter
-	t.Cleanup(func() { cli.ServerStarter = originalStarter })
+// ValidateAttributes simulates validating the attributes input
+func (m *MockValidator) ValidateAttributes(attrs []string) ([]string, error) {
+	args := m.Called(attrs)
+	return args.Get(0).([]string), args.Error(1)
+}
 
-	var calledWithPort string
-	cli.ServerStarter = func(appRunner app.AppRunner, port string) error {
-		calledWithPort = port
-		return nil
+// Mock Server simulates the server for testing purposes
+type MockServer struct {
+	mock.Mock
+}
+
+// Start simulates starting the server
+func (m *MockServer) Start(port string) error {
+	args := m.Called(port)
+	return args.Error(0)
+}
+
+// Stop simulates stopping the server
+func (m *MockServer) Stop() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+// Address simulates getting the server's address
+func (m *MockServer) Address() string {
+	args := m.Called()
+	return args.String(0)
+}
+
+// TestEnvConfigurations simulates the environment configuration for testing purposes
+type TestEnvConfigurations struct {
+	*env.Configurations // Embed the actual type
+	PortToStringFunc    func() string
+	InitiateLoggerFunc  func()
+}
+
+// Override the methods we want to mock in the test configurations
+func (t *TestEnvConfigurations) PortToString() string {
+	if t.PortToStringFunc != nil {
+		return t.PortToStringFunc()
 	}
+	return t.Configurations.PortToString() // Fallback to real implementation
+}
 
-	t.Run("valid_port", func(t *testing.T) {
-		calledWithPort = ""
+func (t *TestEnvConfigurations) InitiateLogger() {
+	if t.InitiateLoggerFunc != nil {
+		t.InitiateLoggerFunc()
+		return
+	}
+	t.Configurations.InitiateLogger() // Fallback to real implementation
+}
 
-		cmd := cli.NewCommand(appInstance)
-		cmd.SetArgs([]string{"serve", "--port=8080"})
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-		if calledWithPort != "8080" {
-			t.Errorf("Expected port 8080, got %s", calledWithPort)
-		}
+// NewTestEnvConfigurations returns a new instance of the testable environment configurations
+func NewTestEnvConfigurations() *TestEnvConfigurations {
+	realConfigs := env.NewConfiguration()
+
+	// Set default test values
+	realConfigs.HttpPort = 8080
+
+	return &TestEnvConfigurations{
+		Configurations: realConfigs,
+	}
+}
+
+// TestInitiateCommands tests the initialization of commands
+func TestInitiateCommands(t *testing.T) {
+	// Create test env with mockable methods
+	testEnv := NewTestEnvConfigurations()
+
+	// Create the mock server
+	mockServer := new(MockServer)
+
+	// Create the command using our testable env configurations
+	cmd := cli.NewCommand(
+		new(MockAppRunner),
+		new(MockValidator),
+		mockServer,
+		testEnv.Configurations,
+	)
+
+	// Initiate root command and verify its structure
+	rootCmd := cmd.InitiateCommands()
+	assert.Equal(t, "ec2drift", rootCmd.Use)
+	assert.Len(t, rootCmd.Commands(), 2)
+	assert.Equal(t, "run", rootCmd.Commands()[0].Use)
+	assert.Equal(t, "serve", rootCmd.Commands()[1].Use)
+}
+
+// TestRunCommandSuccess tests the successful execution of the "run" command
+func TestRunCommandSuccess(t *testing.T) {
+	mockApp := new(MockAppRunner)
+	mockValidator := new(MockValidator)
+	testEnv := NewTestEnvConfigurations()
+
+	// Set up validator mock expectations
+	mockValidator.On("ValidateFormat", "terraform").Return(parser.ParserType("terraform"), nil)
+	mockValidator.On("ValidateAttributes", []string{"attr1"}).Return([]string{"valid_attr1"}, nil)
+
+	// Set up app runner mock expectations
+	mockApp.On("Run", mock.Anything, []string{"valid_attr1"}, parser.ParserType("terraform"), ports.CLI).Return(nil)
+
+	// Create command and initiate root command
+	cmd := cli.NewCommand(
+		mockApp,
+		mockValidator,
+		new(MockServer),
+		testEnv.Configurations,
+	)
+	rootCmd := cmd.InitiateCommands()
+
+	// Set args to run the command with flags
+	rootCmd.SetArgs([]string{"run", "--format", "terraform", "--attributes", "attr1"})
+
+	// Execute the root command
+	err := rootCmd.Execute()
+
+	// Assert no error and verify mocks
+	assert.NoError(t, err)
+	mockValidator.AssertExpectations(t)
+	mockApp.AssertExpectations(t)
+}
+
+// TestRunCommandInvalidFormat tests the behavior of the "run" command when provided with an invalid format
+func TestRunCommandInvalidFormat(t *testing.T) {
+	mockApp := new(MockAppRunner)
+	mockValidator := new(MockValidator)
+	testEnv := NewTestEnvConfigurations()
+
+	// Set up validator mock expectation for invalid format
+	expectedError := errors.New("invalid format specified")
+	mockValidator.On("ValidateFormat", "invalid-format").Return(parser.ParserType(""), expectedError)
+
+	// Create command and set invalid format in args
+	cmd := cli.NewCommand(
+		mockApp,
+		mockValidator,
+		new(MockServer),
+		testEnv.Configurations,
+	)
+	rootCmd := cmd.InitiateCommands()
+	rootCmd.SetArgs([]string{"run", "--format", "invalid-format", "--attributes", "attr1"})
+
+	// Execute and capture error
+	err := rootCmd.Execute()
+	cleanedErr := cleanCobraError(err)
+
+	// Assert error message is as expected
+	assert.Contains(t, cleanedErr, "invalid format specified")
+	mockValidator.AssertExpectations(t)
+	mockApp.AssertNotCalled(t, "Run", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestServeCommandSuccess tests the successful execution of the "serve" command
+func TestServeCommandSuccess(t *testing.T) {
+	mockApp := new(MockAppRunner)
+	mockValidator := new(MockValidator)
+	mockServer := new(MockServer)
+	testEnv := NewTestEnvConfigurations()
+
+	// Set up server mock with expected port
+	expectedPort := testEnv.PortToString()
+	mockServer.On("Start", expectedPort).Return(nil)
+
+	// Create command and initiate root command
+	cmd := cli.NewCommand(
+		mockApp,
+		mockValidator,
+		mockServer,
+		testEnv.Configurations,
+	)
+	rootCmd := cmd.InitiateCommands()
+	rootCmd.SetArgs([]string{"serve"})
+
+	// Execute the command and assert no error
+	err := rootCmd.Execute()
+	assert.NoError(t, err)
+
+	// Verify server start call and no unexpected interactions with other components
+	mockServer.AssertCalled(t, "Start", expectedPort)
+	mockServer.AssertNotCalled(t, "Stop")
+	mockApp.AssertNotCalled(t, "Run")
+	mockValidator.AssertNotCalled(t, "ValidateFormat")
+	mockValidator.AssertNotCalled(t, "ValidateAttributes")
+	mockServer.AssertNumberOfCalls(t, "Start", 1)
+}
+
+// TestServeCommandPortError tests the "serve" command when there is a port error
+func TestServeCommandPortError(t *testing.T) {
+	mockApp := new(MockAppRunner)
+	mockValidator := new(MockValidator)
+	mockServer := new(MockServer)
+	testEnv := NewTestEnvConfigurations()
+
+	// Set up expected error for server start failure
+	expectedPort := testEnv.PortToString()
+	expectedError := errors.New("port 8080 already in use")
+	mockServer.On("Start", expectedPort).Return(expectedError)
+
+	// Create command and initiate root command
+	cmd := cli.NewCommand(
+		mockApp,
+		mockValidator,
+		mockServer,
+		testEnv.Configurations,
+	)
+	rootCmd := cmd.InitiateCommands()
+	rootCmd.SetArgs([]string{"serve"})
+
+	// Execute the command and assert error
+	err := rootCmd.Execute()
+	assert.Error(t, err)
+	assert.EqualError(t, err, expectedError.Error())
+
+	// Verify mock interactions and ensure no other components are involved
+	mockServer.AssertCalled(t, "Start", expectedPort)
+	mockServer.AssertNotCalled(t, "Stop")
+	mockApp.AssertNotCalled(t, "Run")
+	mockValidator.AssertNotCalled(t, "ValidateFormat")
+	mockValidator.AssertNotCalled(t, "ValidateAttributes")
+	mockServer.AssertNumberOfCalls(t, "Start", 1)
+}
+
+// TestRunCommandInvalidAttributes tests the "run" command when invalid attributes are provided
+func TestRunCommandInvalidAttributes(t *testing.T) {
+	mockApp := new(MockAppRunner)
+	mockValidator := new(MockValidator)
+	testEnv := NewTestEnvConfigurations()
+
+	// Set up valid format and invalid attributes
+	mockValidator.On("ValidateFormat", "terraform").Return(parser.ParserType("terraform"), nil)
+	invalidAttrs := []string{"invalid_attr1", "invalid_attr2"}
+	expectedError := errors.New("invalid attributes: invalid_attr1, invalid_attr2")
+	mockValidator.On("ValidateAttributes", invalidAttrs).Return([]string{}, expectedError)
+
+	// Create command and initiate root command
+	cmd := cli.NewCommand(
+		mockApp,
+		mockValidator,
+		new(MockServer),
+		testEnv.Configurations,
+	)
+	rootCmd := cmd.InitiateCommands()
+	rootCmd.SetArgs([]string{
+		"run",
+		"--format", "terraform",
+		"--attributes", strings.Join(invalidAttrs, ","),
 	})
 
-	t.Run("invalid_port", func(t *testing.T) {
-		calledWithPort = ""
+	// Execute the command and assert error
+	err := rootCmd.Execute()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid attributes: invalid_attr1, invalid_attr2")
 
-		cmd := cli.NewCommand(appInstance)
-		cmd.SetArgs([]string{"serve", "--port=invalid"})
-		err := cmd.Execute()
-		if err == nil {
-			t.Fatal("Expected error but got none")
-		}
-		if calledWithPort != "" {
-			t.Error("Server starter should not be called with invalid port")
-		}
-	})
+	// Verify mock interactions
+	mockValidator.AssertExpectations(t)
+	mockApp.AssertNotCalled(t, "Run")
 }
 
-func TestRunCommandFormatFlag(t *testing.T) {
-	app := &mockApp{}
-	cmd := cli.NewCommand(app)
-
-	tests := []struct {
-		format string
-		want   parser.ParserType
-	}{
-		{"terraform", parser.Terraform},
-		{"json", parser.JSON},
-		{"invalid", parser.Terraform},
-		{"", parser.Terraform},
+// cleanCobraError cleans up the error message returned by Cobra command execution
+func cleanCobraError(err error) string {
+	if err == nil {
+		return ""
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.format, func(t *testing.T) {
-
-			app.lastFormat = ""
-
-			args := []string{"run"}
-			if tt.format != "" {
-				args = append(args, "--format="+tt.format)
-			}
-
-			cmd.SetArgs(args)
-			if err := cmd.Execute(); err != nil {
-				t.Fatalf("Expected no error for format %q, got: %v", tt.format, err)
-			}
-
-			if app.lastFormat != tt.want {
-				t.Errorf("For format %q: expected parser type %v, got %v",
-					tt.format, tt.want, app.lastFormat)
-			}
-		})
-	}
-}
-
-func TestValidateAttributes(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   []string
-		want    []string
-		wantErr bool
-		errMsg  string
-	}{
-		{
-			name:    "no attributes",
-			input:   nil,
-			want:    []string{"ami", "instance_type", "security_groups", "tags", "root_block_device.volume_size", "root_block_device.volume_type"},
-			wantErr: false,
-		},
-		{
-			name:    "valid attributes",
-			input:   []string{"ami", "tags"},
-			want:    []string{"ami", "tags"},
-			wantErr: false,
-		},
-		{
-			name:    "invalid attribute",
-			input:   []string{"invalid"},
-			wantErr: true,
-			errMsg:  "invalid attribute \"invalid\"; valid are: [ami instance_type root_block_device.volume_size root_block_device.volume_type security_groups tags]",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := cli.ValidateAttributes(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("validateAttributes() error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if tt.wantErr {
-				if err.Error() != tt.errMsg {
-					t.Errorf("validateAttributes() error = %v, want %v", err.Error(), tt.errMsg)
-				}
-				return
-			}
-			gotSet := make(map[string]struct{})
-			for _, v := range got {
-				gotSet[v] = struct{}{}
-			}
-			wantSet := make(map[string]struct{})
-			for _, v := range tt.want {
-				wantSet[v] = struct{}{}
-			}
-			if !reflect.DeepEqual(gotSet, wantSet) {
-				t.Errorf("validateAttributes() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func getCommand(cmd *cobra.Command, name string) *cobra.Command {
-	for _, sub := range cmd.Commands() {
-		if sub.Name() == name {
-			return sub
-		}
-	}
-	return nil
-}
-
-func checkFlag(t *testing.T, cmd *cobra.Command, name string) {
-	if cmd.Flags().Lookup(name) == nil {
-		t.Errorf("Flag %s not found in command %s", name, cmd.Name())
-	}
+	parts := strings.SplitN(err.Error(), "\nUsage:", 2)
+	return strings.TrimSpace(parts[0])
 }

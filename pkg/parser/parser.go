@@ -13,4 +13,5 @@ type ParserType string
 const (
 	Terraform ParserType = "terraform"
 	JSON      ParserType = "json"
+	Unknown   ParserType = "unknown"
 )
